@@ -1,0 +1,50 @@
+#!/usr/bin/env python
+# -*- encoding: utf-8 -*-
+#'''
+#@File    :   your.yaml
+#@Time    :   2021/04/01
+#@Author  :   Garified Du
+#@Version :   1.0
+#@License :   Licensed under the CC BY-NC 4.0 license (https://creativecommons.org/licenses/by-nc/4.0/)
+#@Desc    :   config for kit training
+#'''
+
+cudnn: True
+gpuid: "3"
+seed: 7240
+port: "29500"
+save_freq: 500
+print_freq: 100
+# dataset settings
+train_data_name: imagenet
+test_data_name: Set14
+data_root: /data3/sap/dataset
+save_root: /data3/sap/nb2nb_new
+imagenet_path : /data3/sjyang/dataset/imagenet_val.h5
+noise_style: gauss25
+crop_size: 256
+in_channels: 3
+out_channels: 3
+batch_size: 4
+num_threads: 0
+# model hyper parameter setting
+epoches: 200
+lr: 1e-4
+weight_decay: 0.5
+niter_decay: 50
+lr_policy: step #{lambda|step|plateau}
+lr_decay_iters: 50
+clip_grad_norm: 0
+gamma: 1.
+# optimization
+optimizer: adam
+gamma1: 0.9
+gamma2: 0.99
+loss_type: mse
+# network configuration
+weight_init: kaiming
+# eval the model in testset
+eval: False
+resume: None
+# save result image
+demo: False

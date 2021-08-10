@@ -40,23 +40,29 @@ from libs.loss import define_loss, compare_psnr, compare_ssim
 from Utils.utils import define_optim, define_scheduler, Logger, AverageMeter
 from libs.benchmark_metrics import Metrics
 from data import get as get_data
+from libs import image
 
 # import dist libs
 from torch.utils.data.distributed import DistributedSampler
 import torch.multiprocessing as mp
 import torch.distributed as dist
 import apex
+#from torch.nn.Module import apex
 from apex.parallel import DistributedDataParallel as DDP
+#from torch.nn.parallel import DistributedDataParallel as DDP
 from apex import amp
+#import torch.cuda.amp as amp
 
 parser = argparse.ArgumentParser(
     description='Pytorch Dist training for Neighbor2Neighbor')
-parser.add_argument('--config', type=str, default='configs/yourconfig.yaml')
+parser.add_argument('--config', type=str)
+parser.add_argument('--savename', type=str)
 args = parser.parse_args()
 config = get_config(args.config)
 config['num_gpus'] = len(config['gpuid'].split(','))
+config['save_name'] = args.savename
 
-os.environ['CUDA_VISBILE_DEVICES'] = config['gpuid']
+os.environ['CUDA_VISIBLE_DEVICES'] = config['gpuid']
 os.environ['MASTER_ADDR'] = 'localhost'
 os.environ['MASTER_PORT'] = config['port']
 
@@ -88,13 +94,16 @@ def val(model, setloader, epoch, gpu):
     ssims = []
     model.eval()
     with torch.no_grad():
-        for _, inputs in tqdm(enumerate(setloader)):
+        for i, inputs in tqdm(enumerate(setloader)):
+            if i > 1000 : break
             noise = inputs['noise'].cuda()
             output = model(noise)
             # output = torch.clamp(output, min=0., max=1.)
             # cal the metric and update the avg_stc
             gt = inputs['gt'].squeeze().numpy()
             output = output.squeeze().cpu().numpy()
+            gt = gt.transpose(1,2,0)
+            output = output.transpose(1,2,0)
             psnr = compare_psnr(gt, output)
             ssim = compare_ssim(gt, output)
             psnrs.append(psnr)
@@ -115,9 +124,10 @@ def train(gpu, config):
     """ 
         @ build the dataset for training
     """
-    dataset = get_data(config)
-    trainset = dataset(config, "train")
-    testset = dataset(config, "test")
+    train_dataset = get_data(config['train_data_name'])
+    test_dataset = get_data(config['test_data_name'])
+    trainset = train_dataset(config, config['train_data_name'])
+    testset = test_dataset(config, config['test_data_name'])
     sampler_train = DistributedSampler(trainset,
                                        num_replicas=config['num_gpus'],
                                        rank=gpu)
@@ -130,14 +140,14 @@ def train(gpu, config):
                               batch_size=batch_size,
                               shuffle=False,
                               num_workers=config['num_threads'],
-                              pin_memory=True,
+                              pin_memory=False,
                               sampler=sampler_train,
                               drop_last=True)
     loader_val = DataLoader(dataset=testset,
                             batch_size=1,
                             shuffle=False,
                             num_workers=1,
-                            pin_memory=True,
+                            pin_memory=False,
                             sampler=sampler_val,
                             drop_last=True)
     model = UNet(config["in_channels"],
@@ -148,11 +158,9 @@ def train(gpu, config):
     """  @ init parameter
     """
 
-    save_folder = os.path.join(
-        config['save_root'], 'batch_{}_lr_{}'.format(config['batch_size'],
-                                                     config['lr']))
-    best_epoch = 0
-    lowest_loss = 0.
+    save_folder = os.path.join(config['save_root'], config['save_name'], 'checkpoint')
+    best_epoch_iter = 0
+    best_psnr = 0.
     resume = 0
     print('=>Save folder: {}\n'.format(save_folder))
     if not os.path.exists(save_folder):
@@ -170,8 +178,8 @@ def train(gpu, config):
         checkpoint = torch.load(config['resume'],
                                 map_location=torch.device('cpu'))
         resume = checkpoint['epoch']
-        lowest_loss = checkpoint['loss']
-        best_epoch = checkpoint['best_epoch']
+        best_psnr = checkpoint['best_psnr']
+        best_epoch_iter = checkpoint['best_epoch_iter']
         model.load_state_dict(checkpoint['state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer'])
         scheduler.load_state_dict(checkpoint['scheduler'])
@@ -214,6 +222,8 @@ def train(gpu, config):
         rmse_train = AverageMeter()
         mae_train = AverageMeter()
         time_snap = time.time()
+
+
         for i, inputs in tqdm(enumerate(loader_train)):
             gt, noise = inputs['gt'].cuda(gpu), inputs['noise'].cuda(gpu)
             optimizer.zero_grad()
@@ -256,57 +266,36 @@ def train(gpu, config):
                                  batch_time=batch_time,
                                  loss=losses,
                                  rmse_train=rmse_train))
-            if (i + 1) % config['save_freq'] == 0:
+            if (i + 1) % config['save_freq'] == 0 or (i+1) == len(loader_train):
                 print('=> Start sub-selection validation set')
-                rmse, mae = val(model, loader_val, epoch, gpu)
+                psnr, ssim = val(model, loader_val, epoch, gpu)
                 model.train()
                 if gpu == 0:
-                    print("===> Average RMSE score on selection set is {:.6f}".
-                          format(rmse))
-                    print("===> Average MAE score on selection set is {:.6f}".
-                          format(mae))
+                    print("===> Average PSRN score on selection set is {:.6f}".
+                          format(psnr))
+                    print("===> Average SSIM score on selection set is {:.6f}".
+                          format(ssim))
                     print(
-                        "===> Last best score was RMSE of {:.6f} in epoch {}".
-                        format(lowest_loss, best_epoch))
+                        "===> Last best score was PSNR of {:.6f} in epoch, iter {}".
+                        format(best_psnr, best_epoch_iter))
 
-                    if rmse > lowest_loss:
-                        lowest_loss = rmse
-                        best_epoch = epoch
-                        states = {
-                            'epoch': epoch,
-                            'best_epoch': best_epoch,
-                            'loss': lowest_loss,
-                            'state_dict': model.module.state_dict(),
-                            'optimizer': optimizer.state_dict(),
-                            'scheduler': scheduler.state_dict(),
-                            'amp': amp.state_dict()
-                        }
+                    is_best=False
+                    if psnr > best_psnr:
+                        best_psnr = psnr
+                        best_epoch_iter = (epoch, i+1)
+                        is_best = True
 
-                        save_checkpoints(states, save_folder, epoch, gpu, True)
-        # save checkpoints
-        print('=> Start selection validation set')
-        rmse, mae = val(model, loader_val, epoch, gpu)
-        model.train()
-        if gpu == 0:
-            print("===> Average RMSE score on selection set is {:.6f}".format(
-                rmse))
-            print("===> Average MAE score on selection set is {:.6f}".format(
-                mae))
-            print("===> Last best score was RMSE of {:.6f} in epoch {}".format(
-                lowest_loss, best_epoch))
-            if rmse > lowest_loss:
-                best_epoch = epoch
-                lowest_loss = rmse
-                states = {
-                    'epoch': epoch,
-                    'best_epoch': best_epoch,
-                    'loss': lowest_loss,
-                    'state_dict': model.module.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'scheduler': scheduler.state_dict(),
-                    'amp': amp.state_dict()
-                }
-                save_checkpoints(states, save_folder, epoch, gpu, True)
+                    states = {
+                        'epoch': epoch,
+                        'best_epoch_iter': best_epoch_iter,
+                        'best_psnr': best_psnr,
+                        'state_dict': model.module.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'scheduler': scheduler.state_dict(),
+                        'amp': amp.state_dict()
+                    }
+
+                    save_checkpoints(states, save_folder, epoch, i+1, is_best)
 
         if config['lr_policy'] == 'plateau':
             scheduler.step(rmse)
@@ -317,13 +306,14 @@ def train(gpu, config):
         print('=>> the model training finish!')
 
 
-def save_checkpoints(model_state, save_folder, epoch, gpuid, is_best=False):
+def save_checkpoints(model_state, save_folder, epoch, iter, is_best=False):
     # filepath = os.path.join(save_folder, 'checkpoint_{}.pt'.format(gpuid))
     # print('save the current model : {} \n'.format(filepath))
     if is_best:
-        torch.save(model_state,
-                   os.path.join(save_folder, 'model_best_{}.pt'.format(gpuid)))
-        print('Best model in epoch {} copied!! \n'.format(epoch))
+        torch.save(model_state, os.path.join(save_folder, 'model_best.pt'))
+        print('Best model saved')
+    torch.save(model_state, os.path.join(save_folder, 'model_%03d_%05d.pt'%(epoch, iter)))
+    print('Model in epoch {} iter {} saved!! \n'.format(epoch, iter))
 
 
 def test(config):
@@ -334,7 +324,7 @@ def test(config):
                              batch_size=1,
                              shuffle=False,
                              num_workers=config['num_threads'])
-    model = UNet(config["in_channels"], config["out_channels"])
+    model = UNet(config["in_channels"], config["out_channels"], post_processing=True)
     if config['resume'] != 'None':
         checkpoint = torch.load(config['resume'],
                                 map_location=torch.device('cpu'))
@@ -352,6 +342,10 @@ def test(config):
             output = model(noise)
             gt = inputs['gt'].squeeze().numpy()
             output = output.squeeze().cpu().numpy()
+            gt = gt.transpose(1,2,0)
+            output = output.transpose(1,2,0)
+            #output = np.clip(output, 0, 255)
+            output = np.clip(output, 0, 1)
             psnr = compare_psnr(gt, output)
             ssim = compare_ssim(gt, output)
             psnrs.append(psnr)
@@ -360,8 +354,49 @@ def test(config):
     ssims = np.array(ssims)
     print("PSNR, SSIM:{},{}\n".format(psnrs.mean(), ssims.mean()))
 
+def demo(config):
+    dir_result = os.path.join(config['save_root'], config['save_name'], 'result')
+    os.makedirs(dir_result, exist_ok=True) 
+    dataset = get_data(config['test_data_name'])
+    testset = dataset(config, config['test_data_name'])
+
+    loader_test = DataLoader(dataset=testset,
+                             batch_size=1,
+                             shuffle=False,
+                             num_workers=config['num_threads'])
+    model = UNet(config["in_channels"], config["out_channels"], post_processing=True)
+    checkpoint = torch.load(config['resume'], map_location=torch.device('cpu'))
+    model.load_state_dict(checkpoint['state_dict'])
+    print("Load pretrained model finish!")
+    del checkpoint
+    model.cuda()
+
+    psnrs = []
+    ssims = []
+    model.eval()
+    with torch.no_grad():
+        for i, inputs in tqdm(enumerate(loader_test)):
+            noise = inputs['noise'].cuda()
+            output = model(noise)
+
+            gt = (255*inputs['gt']).squeeze().numpy().transpose(1,2,0).astype('uint8')
+            noise = (255*inputs['noise']).squeeze().numpy().transpose(1,2,0).astype('uint8')
+            #output = torch.clamp(output, 0, 255)
+            output = torch.clamp(output, 0, 1)
+            output = (255*output).squeeze().cpu().numpy().transpose(1,2,0).astype('uint8')
+
+            path = os.path.join(dir_result, '%04d.jpg'%(i))
+
+            img_list = [noise, gt, output]
+            result_noisy_clean_denoised =  image.get_concat_img(img_list, cols=3)
+            image.save_image(path, result_noisy_clean_denoised)
+
 
 def main(config):
+    if config['demo'] :
+        demo(config)
+        return 
+
     if not config['eval']:
         if config['num_gpus'] <= 1:
             train(0, config)

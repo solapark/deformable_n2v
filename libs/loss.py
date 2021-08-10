@@ -10,11 +10,11 @@ from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
 
 def compare_psnr(gt, pred):
-    return peak_signal_noise_ratio(gt, pred, data_range=0.5)
+    return peak_signal_noise_ratio(gt, pred, data_range=1.0)
 
 
 def compare_ssim(gt, pred):
-    return structural_similarity(gt, pred)
+    return structural_similarity(gt, pred, multichannel=True)
 
 
 def allowed_losses():

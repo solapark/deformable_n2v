@@ -3,9 +3,15 @@ from importlib import import_module
 from torch.utils.data import Dataset
 
 
-def get(args):
-    data_name = args["data_name"]
-    module_name = 'data.' + data_name.lower()
+def get(data_name):
+    if data_name == 'imagenet':
+        module_name = 'data.imagenet'
+    elif data_name in ['Set14', 'kodak']:
+        module_name = 'data.synth_noise_dataset'
+        data_name = 'synth_noise_dataset'
+    else :
+        module_name = 'data.real_noise_dataset'
+        data_name = 'real_noise_dataset'
     module = import_module(module_name)
 
     return getattr(module, data_name)
